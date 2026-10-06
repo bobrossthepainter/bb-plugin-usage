@@ -227,6 +227,8 @@ describe("live Pi session indicator", () => {
       scope: { kind: "host_path", hostId: "host-1", cwd: null },
       start: expect.objectContaining({ command: expect.stringContaining("/home/alice/.bb/pi-bridge-sessions/pi_session-1.jsonl") }),
     }));
+    const startCommand = create.mock.calls[0]![0].start.command;
+    expect(startCommand).toContain("__BB_PI_SESSION_INDICATOR__\n );");
   });
 });
 

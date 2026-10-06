@@ -919,7 +919,9 @@ export async function loadSessionIndicator(bb: BbPluginApi, threadId: string) {
   if (host.status !== "connected") return unavailableSessionIndicator();
   const home = (await bb.sdk.hosts.directory({ hostId, signal })).directory;
   const sessionFile = `${home.replace(/[\\/]$/, "")}/.bb/pi-bridge-sessions/${providerThreadId}.jsonl`;
-  const command = `BB_PI_SESSION_FILE=${shellQuote(sessionFile)} node - <<'__BB_PI_SESSION_INDICATOR__'\n${piSessionIndicatorScript}\n__BB_PI_SESSION_INDICATOR__`;
+  // The trailing newline is required so heldHostCommand() does not append its
+  // closing subshell syntax to the heredoc terminator line.
+  const command = `BB_PI_SESSION_FILE=${shellQuote(sessionFile)} node - <<'__BB_PI_SESSION_INDICATOR__'\n${piSessionIndicatorScript}\n__BB_PI_SESSION_INDICATOR__\n`;
 
   const [output, contextRows] = await Promise.all([
     runHostCommand(bb, host, command, signal, {
