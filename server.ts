@@ -1,7 +1,7 @@
 import { grokLimitsCommand, grokLimitSnapshotSchema } from "./lib/grok-limits";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   parseHostUsageAggregates, parseOpenCode, repriceUsageRecord,
@@ -24,6 +24,11 @@ import { createAccountPoolLimitsLoader, mergeAccountPoolLimits } from "./lib/acc
 import {
   copilotEnterpriseLimitsCommand, copilotEnterpriseSnapshotSchema, normalizeCopilotEnterpriseHost,
 } from "./lib/copilot-enterprise";
+import {
+  PI_SESSION_INDICATOR_BEGIN,
+  PI_SESSION_INDICATOR_END,
+  piSessionIndicatorScript,
+} from "./lib/pi-session-indicator-command";
 
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
@@ -60,6 +65,18 @@ const providerLimitSchema = z.object({
     status: z.enum(["ok", "error"]), error: z.string().nullable(), lastUpdatedAt: z.string().nullable(),
   })),
 });
+const piSessionIndicatorSchema = z.object({
+  available: z.boolean(),
+  inputTokens: z.number(), outputTokens: z.number(),
+  cacheReadTokens: z.number(), cacheWriteTokens: z.number(),
+  latestCacheHitRate: z.number().nullable(), costUsd: z.number(),
+  subscription: z.boolean(), autoCompaction: z.boolean(),
+});
+const sessionIndicatorSchema = piSessionIndicatorSchema.extend({
+  contextUsedTokens: z.number().nullable(),
+  contextWindowTokens: z.number().nullable(),
+  contextEstimated: z.boolean(),
+});
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
 
@@ -73,6 +90,7 @@ export const rpcContract = defineRpcContract({
   providerLimits: { input: z.null(), output: z.object({
     limits: z.array(providerLimitSchema), accountPoolError: z.string().nullable(),
   }) },
+  sessionIndicator: { input: z.object({ threadId: z.string() }), output: sessionIndicatorSchema },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
 
@@ -861,6 +879,79 @@ export async function runHostCommand(
   }
 }
 
+const unavailableSessionIndicator = (): z.infer<typeof sessionIndicatorSchema> => ({
+  available: false,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+  latestCacheHitRate: null,
+  costUsd: 0,
+  subscription: false,
+  autoCompaction: false,
+  contextUsedTokens: null,
+  contextWindowTokens: null,
+  contextEstimated: true,
+});
+
+export async function loadSessionIndicator(bb: BbPluginApi, threadId: string) {
+  const signal = AbortSignal.timeout(15_000);
+  const thread = await bb.sdk.threads.get({ threadId, include: "environment,host", signal });
+  if (thread.providerId !== "pi") return unavailableSessionIndicator();
+
+  const identityRows = await bb.sdk.threads.events.list({
+    threadId,
+    types: ["thread/identity"],
+    order: "desc",
+    limit: "1",
+    signal,
+  });
+  const identity = identityRows[0];
+  if (!identity || identity.type !== "thread/identity") return unavailableSessionIndicator();
+  const providerThreadId = identity.data.providerThreadId;
+  if (!/^[A-Za-z0-9_-]+$/.test(providerThreadId)) return unavailableSessionIndicator();
+
+  const includedHost = "host" in thread ? thread.host : null;
+  const includedEnvironment = "environment" in thread ? thread.environment : null;
+  const hostId = includedHost?.id ?? includedEnvironment?.hostId;
+  if (!hostId) return unavailableSessionIndicator();
+  const host = includedHost ?? await bb.sdk.hosts.get({ hostId, signal });
+  if (host.status !== "connected") return unavailableSessionIndicator();
+  const home = (await bb.sdk.hosts.directory({ hostId, signal })).directory;
+  const sessionFile = `${home.replace(/[\\/]$/, "")}/.bb/pi-bridge-sessions/${providerThreadId}.jsonl`;
+  const command = `BB_PI_SESSION_FILE=${shellQuote(sessionFile)} node - <<'__BB_PI_SESSION_INDICATOR__'\n${piSessionIndicatorScript}\n__BB_PI_SESSION_INDICATOR__`;
+
+  const [output, contextRows] = await Promise.all([
+    runHostCommand(bb, host, command, signal, {
+      title: "Usage: live Pi session", timeoutMs: 12_000, home,
+    }),
+    bb.sdk.threads.events.list({
+      threadId,
+      types: ["thread/contextWindowUsage/updated"],
+      order: "desc",
+      limit: "1",
+      signal,
+    }).catch(() => []),
+  ]);
+  const summaryMatch = output.match(new RegExp(
+    `${PI_SESSION_INDICATOR_BEGIN}\\s*([\\s\\S]*?)\\s*${PI_SESSION_INDICATOR_END}`,
+  ));
+  if (!summaryMatch) return unavailableSessionIndicator();
+  const summary = piSessionIndicatorSchema.parse(JSON.parse(summaryMatch[1]!));
+  if (!summary.available) return unavailableSessionIndicator();
+
+  const contextRow = contextRows[0];
+  const context = contextRow?.type === "thread/contextWindowUsage/updated"
+    ? contextRow.data.contextWindowUsage
+    : null;
+  return sessionIndicatorSchema.parse({
+    ...summary,
+    contextUsedTokens: context?.usedTokens ?? null,
+    contextWindowTokens: context?.modelContextWindow ?? null,
+    contextEstimated: context?.estimated ?? true,
+  });
+}
+
 // OpenCode usage is collected on the enrolled HOST, so the
 // day bucket and the 90-day cutoff MUST use the host's local timezone, not
 // UTC. Otherwise machines in a positive/negative offset see "today"'s usage
@@ -1282,6 +1373,20 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
+  const sessionIndicatorRequests = new Map<string, Promise<z.infer<typeof sessionIndicatorSchema>>>();
+  const readSessionIndicator = (threadId: string) => {
+    const active = sessionIndicatorRequests.get(threadId);
+    if (active) return active;
+    const request = loadSessionIndicator(bb, threadId)
+      .catch((error) => {
+        bb.log.debug(`Live session usage unavailable for ${threadId}: ${errorMessage(error)}`);
+        return unavailableSessionIndicator();
+      })
+      .finally(() => sessionIndicatorRequests.delete(threadId));
+    sessionIndicatorRequests.set(threadId, request);
+    return request;
+  };
+
   bb.rpc.register(rpcContract, {
     async dashboard() {
       const machines = await loadMachines();
@@ -1314,11 +1419,22 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
     providerLimits: readProviderLimits,
+    sessionIndicator({ threadId }) {
+      return readSessionIndicator(threadId);
+    },
     sync() {
       void syncAll().catch((error) => bb.log.error(`Usage sync failed: ${errorMessage(error)}`));
       return { ok: true as const };
     },
   });
+
+  const publishSessionIndicatorUpdate = ({ thread }: { thread: { id: string; providerId: string } }) => {
+    if (thread.providerId === "pi") {
+      bb.realtime.publish("session-indicator-updated", { threadId: thread.id });
+    }
+  };
+  bb.events?.on("thread.idle", publishSessionIndicatorUpdate);
+  bb.events?.on("thread.failed", publishSessionIndicatorUpdate);
 
   bb.background.service("usage-collector", {
     async start(signal) {

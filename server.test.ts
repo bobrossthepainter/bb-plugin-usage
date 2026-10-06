@@ -7,15 +7,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
-vi.mock("@bb/plugin-sdk", () => ({
+vi.mock("@get-bb/plugin-sdk", () => ({
   defineRpcContract: <T>(contract: T) => contract,
 }));
 
 import plugin, {
   rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
+  kilocodeCommand, loadSessionIndicator, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 import { getSourceIssueMessage } from "./lib/usage-view-state";
@@ -164,6 +164,69 @@ describe("JSON agent roots", () => {
       "/home/user/.bb/pi-bridge-sessions",
       "/data/pi",
     ]);
+  });
+});
+
+describe("live Pi session indicator", () => {
+  it("combines host-reduced session totals with the latest active context", async () => {
+    const terminalOutput = [
+      "__BB_PI_SESSION_INDICATOR_BEGIN__",
+      JSON.stringify({
+        available: true,
+        inputTokens: 80_000,
+        outputTokens: 6_900,
+        cacheReadTokens: 767_000,
+        cacheWriteTokens: 0,
+        latestCacheHitRate: 97.7,
+        costUsd: 0.766,
+        subscription: true,
+        autoCompaction: true,
+      }),
+      "__BB_PI_SESSION_INDICATOR_END__",
+      "__BB_HOST_COMMAND_DONE__:0",
+    ].join("\n");
+    const create = vi.fn(async () => ({ id: "terminal-1" }));
+    const eventsList = vi.fn(async (request: { types: string[] }) => request.types[0] === "thread/identity"
+      ? [{ type: "thread/identity", data: { providerThreadId: "pi_session-1" } }]
+      : [{
+          type: "thread/contextWindowUsage/updated",
+          data: { contextWindowUsage: { usedTokens: 288_000, modelContextWindow: 1_000_000, estimated: false } },
+        }]);
+    const bb = {
+      sdk: {
+        threads: {
+          get: vi.fn(async () => ({
+            providerId: "pi",
+            host: { id: "host-1", name: "Machine", status: "connected" },
+          })),
+          events: { list: eventsList },
+        },
+        hosts: { directory: vi.fn(async () => ({ directory: "/home/alice" })) },
+        terminals: {
+          create,
+          get: vi.fn(async () => ({ status: "running" })),
+          output: vi.fn(async () => ({
+            chunks: [{ seq: 0, dataBase64: Buffer.from(terminalOutput).toString("base64") }],
+            truncated: false,
+          })),
+          close: vi.fn(async () => undefined),
+        },
+      },
+    } as unknown as BbPluginApi;
+
+    await expect(loadSessionIndicator(bb, "thread-1")).resolves.toMatchObject({
+      available: true,
+      inputTokens: 80_000,
+      latestCacheHitRate: 97.7,
+      subscription: true,
+      contextUsedTokens: 288_000,
+      contextWindowTokens: 1_000_000,
+      contextEstimated: false,
+    });
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      scope: { kind: "host_path", hostId: "host-1", cwd: null },
+      start: expect.objectContaining({ command: expect.stringContaining("/home/alice/.bb/pi-bridge-sessions/pi_session-1.jsonl") }),
+    }));
   });
 });
 

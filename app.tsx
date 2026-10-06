@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
-import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
+import { definePluginApp, useComposer, useRealtime, useRealtimeConnectionState, useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import {
+  formatSessionIndicator,
+  sessionIndicatorContextPercent,
+  type SessionIndicatorData,
+} from "./lib/session-indicator";
 import { Icon } from "@/components/ui/icon";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -137,6 +142,108 @@ function money(value: number) {
 
 function compact(value: number) {
   return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+}
+
+function SessionUsageIndicator() {
+  const composer = useComposer();
+  const rpc = useRpc<typeof rpcContract>();
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const markerRef = useRef<HTMLSpanElement | null>(null);
+  const requestGeneration = useRef(0);
+  const previousRunning = useRef<boolean | null>(null);
+  const [data, setData] = useState<SessionIndicatorData | null>(null);
+  const threadId = composer.scope.kind === "thread" ? composer.scope.threadId : null;
+  const label = data ? formatSessionIndicator(data) : "";
+
+  const refresh = useCallback(async () => {
+    if (!threadId) return;
+    const generation = ++requestGeneration.current;
+    try {
+      const result = await rpc.call("sessionIndicator", { threadId });
+      if (requestGeneration.current === generation) setData(result.available ? result : null);
+    } catch {
+      // Preserve the last good snapshot through transient host reconnects.
+    }
+  }, [rpc, threadId]);
+
+  useEffect(() => {
+    const wasRunning = previousRunning.current;
+    previousRunning.current = composer.isRunning;
+    if (wasRunning === null) {
+      void refresh();
+      return;
+    }
+    if (!wasRunning || composer.isRunning) return;
+    void refresh();
+    const retry = window.setTimeout(() => void refresh(), 350);
+    return () => window.clearTimeout(retry);
+  }, [composer.isRunning, refresh]);
+
+  useRealtime("session-indicator-updated", (payload) => {
+    if (payload && typeof payload === "object" && "threadId" in payload && payload.threadId === threadId) {
+      void refresh();
+    }
+  });
+
+  useEffect(() => {
+    const anchor = anchorRef.current;
+    if (!anchor) return;
+    const composerElement = anchor.closest<HTMLElement>("[data-follow-up-composer]");
+    if (!composerElement) return;
+    const marker = document.createElement("span");
+    marker.dataset.bbUsageSessionIndicator = "";
+    marker.setAttribute("aria-label", "Session token usage and estimated API cost");
+    markerRef.current = marker;
+
+    const placeMarker = () => {
+      if (!label) {
+        marker.remove();
+        return;
+      }
+      const footer = composerElement.querySelector<HTMLElement>("[data-follow-up-composer-footer]");
+      const contextButton = footer?.querySelector<HTMLButtonElement>(
+        'button[aria-label^="Context window"], button[aria-label*="context" i]',
+      );
+      const contextControls = contextButton?.parentElement;
+      if (!contextButton || !contextControls) {
+        marker.remove();
+        return;
+      }
+      if (marker.textContent !== label) marker.textContent = label;
+      marker.title = `${data?.contextEstimated ? "Estimated active-model context" : "Active-model context"}; token totals and cost cover the full session.`;
+      const contextPercent = data ? sessionIndicatorContextPercent(data) : null;
+      // Plugin utility CSS is scoped to the plugin root, while this node is
+      // intentionally inserted into BB's native footer. Keep its small set of
+      // styles inline so placement does not depend on host utility classes.
+      Object.assign(marker.style, {
+        maxWidth: "min(65vw, 38rem)",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+        fontSize: "11px",
+        fontVariantNumeric: "tabular-nums",
+        color: contextPercent !== null && contextPercent > 90
+          ? "var(--destructive)"
+          : contextPercent !== null && contextPercent > 70
+            ? "var(--warning-text)"
+            : "var(--muted-foreground)",
+      });
+      if (marker.parentElement !== contextControls || marker.nextSibling !== contextButton) {
+        contextControls.insertBefore(marker, contextButton);
+      }
+    };
+
+    placeMarker();
+    const observer = new MutationObserver(placeMarker);
+    observer.observe(composerElement, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      marker.remove();
+      markerRef.current = null;
+    };
+  }, [data, label]);
+
+  return <span ref={anchorRef} className="hidden" aria-hidden="true" />;
 }
 
 function percentage(value: number, total: number) {
@@ -1673,5 +1780,10 @@ export default definePluginApp((app) => {
     path: "usage",
     component: UsageDashboard,
     headerContent: UsageHeaderControls,
+  });
+  app.composer.customize({
+    id: "session-usage-indicator",
+    scopes: ["thread"],
+    actions: [{ id: "session-usage-indicator-anchor", component: SessionUsageIndicator }],
   });
 });
