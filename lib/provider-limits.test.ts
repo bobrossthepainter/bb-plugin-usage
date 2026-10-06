@@ -48,6 +48,7 @@ describe("provider limit presentation", () => {
       cost: { usedUsdCents: 1250, limitUsdCents: 5000 },
     })).toBe("$12.50 of $50.00");
     expect(formatLimitValue({ label: "Weekly", usedPercent: 47.6, resetsAt: null })).toBe("48% used");
+    expect(formatLimitValue({ label: "Chat", usedPercent: 0, resetsAt: null, unlimited: true })).toBe("Unlimited");
   });
 
   it("unifies one subscription across machines without double-counting account-wide windows", () => {

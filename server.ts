@@ -21,6 +21,9 @@ import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
 import { createAccountPoolLimitsLoader, mergeAccountPoolLimits } from "./lib/account-pool-limits";
+import {
+  copilotEnterpriseLimitsCommand, copilotEnterpriseSnapshotSchema, normalizeCopilotEnterpriseHost,
+} from "./lib/copilot-enterprise";
 
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
@@ -40,7 +43,7 @@ const syncStateSchema = z.object({
   startedAt: z.string().nullable(), completedAt: z.string().nullable(), error: z.string().nullable(),
 });
 const providerLimitWindowSchema = z.object({
-  label: z.string(), usedPercent: z.number(), resetsAt: z.string().nullable(),
+  label: z.string(), usedPercent: z.number(), resetsAt: z.string().nullable(), unlimited: z.literal(true).optional(),
   cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
 });
 const providerLimitSchema = z.object({
@@ -75,7 +78,12 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string };
+type CollectorSettings = {
+  codexHomes?: string;
+  piSessionRoots: string;
+  primeSessionRoots: string;
+  copilotEnterpriseHost?: string;
+};
 
 const AGENTS = [
   { id: "codex", name: "Codex" },
@@ -102,6 +110,10 @@ const LIMIT_PROVIDERS = [
 export const grokLimitsMigration = `CREATE TABLE IF NOT EXISTS grok_limits (
   machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, snapshot_json TEXT,
   fetched_at TEXT, error TEXT
+);`;
+export const copilotEnterpriseLimitsMigration = `CREATE TABLE IF NOT EXISTS copilot_enterprise_limits (
+  machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, hostname TEXT NOT NULL,
+  snapshot_json TEXT, fetched_at TEXT, error TEXT
 );`;
 
 export async function syncGrokLimits(
@@ -156,6 +168,70 @@ export function loadStoredGrokLimits(db: Database, connectedMachineIds: Set<stri
   });
 }
 
+export async function syncCopilotEnterprise(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  hostname: string,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  try {
+    const output = await executeHostCommand(bb, machine, copilotEnterpriseLimitsCommand(hostname), signal, {
+      title: "Usage: Copilot Enterprise limits", timeoutMs: COPILOT_ENTERPRISE_SYNC_TIMEOUT_MS,
+    });
+    const diagnostic = output.match(/__BB_USAGE_ERROR__:([^\r\n]+)/)?.[1]?.trim();
+    if (diagnostic) throw new Error(diagnostic);
+    const json = output.match(/__BB_USAGE_BEGIN__\s*([\s\S]*?)\s*__BB_USAGE_END__:0/)?.[1];
+    if (!json) throw new Error("Copilot Enterprise quota query returned incomplete output.");
+    const snapshot = copilotEnterpriseSnapshotSchema.parse(JSON.parse(json));
+    db.prepare(`INSERT INTO copilot_enterprise_limits (
+        machine_id, machine_name, hostname, snapshot_json, fetched_at, error
+      ) VALUES (?, ?, ?, ?, ?, NULL) ON CONFLICT(machine_id) DO UPDATE SET
+      machine_name=excluded.machine_name, hostname=excluded.hostname, snapshot_json=excluded.snapshot_json,
+      fetched_at=excluded.fetched_at, error=NULL`)
+      .run(machine.id, machine.name, hostname, JSON.stringify(snapshot), new Date().toISOString());
+    bb.log.info(`${machine.name}/copilot-enterprise: ${snapshot.windows.length} limit windows`);
+  } catch (error) {
+    const message = errorMessage(error);
+    if (message === "no-copilot-enterprise-credential") {
+      db.prepare("DELETE FROM copilot_enterprise_limits WHERE machine_id=?").run(machine.id);
+      bb.log.debug(`${machine.name}/copilot-enterprise: not configured`);
+      return;
+    }
+    const hasSnapshot = Boolean(db.prepare("SELECT 1 FROM copilot_enterprise_limits WHERE machine_id=?").get(machine.id));
+    db.prepare(`INSERT INTO copilot_enterprise_limits (machine_id, machine_name, hostname, error)
+      VALUES (?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
+      machine_name=excluded.machine_name, hostname=excluded.hostname, error=excluded.error`)
+      .run(machine.id, machine.name, hostname, message);
+    bb.log.warn(`${machine.name}/copilot-enterprise: ${hasSnapshot ? "retaining previous snapshot; " : ""}${message}`);
+  }
+}
+
+export function loadStoredCopilotEnterpriseLimits(
+  db: Database,
+  connectedMachineIds: Set<string>,
+): ProviderLimitSource[] {
+  const rows = db.prepare("SELECT * FROM copilot_enterprise_limits ORDER BY machine_name").all() as Array<{
+    machine_id: string; machine_name: string; snapshot_json: string | null; fetched_at: string | null; error: string | null;
+  }>;
+  return rows.filter((row) => connectedMachineIds.has(row.machine_id)).flatMap((row): ProviderLimitSource[] => {
+    let snapshot: z.infer<typeof copilotEnterpriseSnapshotSchema> | null = null;
+    let error = row.error;
+    try { if (row.snapshot_json) snapshot = copilotEnterpriseSnapshotSchema.parse(JSON.parse(row.snapshot_json)); }
+    catch { error = "Stored Copilot Enterprise limits could not be read."; }
+    if (!snapshot?.windows.length) return [];
+    return [{
+      machineId: row.machine_id, machineName: row.machine_name,
+      agentId: "copilot", agentName: "GitHub Copilot",
+      providerId: "github-copilot", providerName: "GitHub Copilot Enterprise",
+      accountEmail: null, accountIdentity: snapshot.accountIdentity, planLabel: snapshot.planLabel,
+      windows: snapshot.windows, lastUpdatedAt: row.fetched_at,
+      status: error ? "error" : "ok", error,
+    }];
+  });
+}
+
 const PROVIDER_LIMITS_TIMEOUT_MS = 5_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
@@ -165,6 +241,7 @@ const DEVIN_SYNC_TIMEOUT_MS = 60_000;
 const KILOCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
+const COPILOT_ENTERPRISE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
 const DASHBOARD_HISTORY_DAYS = 90;
 const OPENCODE_HISTORY_DAYS = DASHBOARD_HISTORY_DAYS;
@@ -443,6 +520,7 @@ function reconcileMachines(db: Database, machineIds: string[]) {
     db.prepare(`DELETE FROM grok_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limit_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
+    db.prepare(`DELETE FROM copilot_enterprise_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     deleteOrphanEvents(db);
   })();
 }
@@ -1074,9 +1152,15 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Optional semicolon-separated absolute session directories. The default ~/.prime/agent/sessions and its recursive-agent artifacts are always scanned.",
       default: "",
     },
+    copilotEnterpriseHost: {
+      type: "string",
+      label: "GitHub Enterprise hostname",
+      description: "Optional hostname for Copilot Enterprise limits, for example ghe.example.com. Authenticate on each machine with gh auth login --hostname <host> --web.",
+      default: "",
+    },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration, copilotEnterpriseLimitsMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
@@ -1092,6 +1176,17 @@ export default async function plugin(bb: BbPluginApi) {
       const machines = await bb.sdk.hosts.list({ signal: timeoutSignal(SYNC_HOSTS_TIMEOUT_MS, serviceSignal) });
       reconcileMachines(db, machines.map((machine) => machine.id));
       const collectorSettings = await settings.get();
+      let copilotEnterpriseHost: string | null = null;
+      try {
+        copilotEnterpriseHost = normalizeCopilotEnterpriseHost(collectorSettings.copilotEnterpriseHost ?? "");
+      } catch (error) {
+        bb.log.warn(`Copilot Enterprise limits are disabled: ${errorMessage(error)}`);
+      }
+      if (copilotEnterpriseHost) {
+        db.prepare("DELETE FROM copilot_enterprise_limits WHERE hostname<>?").run(copilotEnterpriseHost);
+      } else {
+        db.prepare("DELETE FROM copilot_enterprise_limits").run();
+      }
       for (const machine of machines) {
         if (serviceSignal?.aborted) throw serviceSignal.reason;
         if (machine.status !== "connected") {
@@ -1126,6 +1221,10 @@ export default async function plugin(bb: BbPluginApi) {
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
           syncGrokLimits(bb, db, machine, timeoutSignal(60_000, serviceSignal)),
           syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
+          ...(copilotEnterpriseHost ? [syncCopilotEnterprise(
+            bb, db, machine, copilotEnterpriseHost,
+            timeoutSignal(COPILOT_ENTERPRISE_SYNC_TIMEOUT_MS, serviceSignal),
+          )] : []),
         ]);
       }
       return new Date().toISOString();
@@ -1169,6 +1268,7 @@ export default async function plugin(bb: BbPluginApi) {
             ...await loadProviderLimits(bb, machines, db),
             ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
             ...loadStoredGrokLimits(db, connectedMachineIds),
+            ...loadStoredCopilotEnterpriseLimits(db, connectedMachineIds),
           ]);
         })(),
         loadAccountPoolLimits(),

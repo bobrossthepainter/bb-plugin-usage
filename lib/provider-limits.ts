@@ -2,6 +2,7 @@ export type ProviderLimitWindow = {
   label: string;
   usedPercent: number;
   resetsAt: string | null;
+  unlimited?: true;
   cost?: {
     usedUsdCents: number;
     limitUsdCents: number;
@@ -90,7 +91,7 @@ export function mergeLimitWindows(sources: ReadonlyArray<Pick<ProviderLimitSourc
         order.push(key);
         windows.set(key, window.cost
           ? { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt, cost: { ...window.cost } }
-          : { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt });
+          : { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt, ...(window.unlimited ? { unlimited: true as const } : {}) });
         continue;
       }
       const currentReset = current.resetsAt ? Date.parse(current.resetsAt) : Number.NaN;
@@ -102,7 +103,7 @@ export function mergeLimitWindows(sources: ReadonlyArray<Pick<ProviderLimitSourc
       if (nextIsNewerCycle || (sameCycle && window.usedPercent > current.usedPercent)) {
         windows.set(key, window.cost
           ? { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt, cost: { ...window.cost } }
-          : { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt });
+          : { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt, ...(window.unlimited ? { unlimited: true as const } : {}) });
       }
     }
   }
@@ -194,6 +195,7 @@ export function formatLimitReset(resetsAt: string | null, nowMs = Date.now()) {
 }
 
 export function formatLimitValue(window: ProviderLimitWindow) {
+  if (window.unlimited) return "Unlimited";
   if (window.cost) {
     return `$${(window.cost.usedUsdCents / 100).toFixed(2)} of $${(window.cost.limitUsdCents / 100).toFixed(2)}`;
   }

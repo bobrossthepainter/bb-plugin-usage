@@ -9,6 +9,7 @@ const functions = [
   ["lib/devin-sqlite-collector.ts", "devinSqliteCollector"],
   ["lib/kilocode-sqlite-collector.ts", "kilocodeSqliteCollector"],
   ["lib/grok-limits.ts", "normalizeGrokBilling"],
+  ["lib/copilot-enterprise.ts", "normalizeCopilotEnterprise"],
 ];
 const root = new URL("../", import.meta.url);
 const output = new URL("lib/host-scripts.generated.ts", root);
