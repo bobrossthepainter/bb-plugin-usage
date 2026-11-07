@@ -16,7 +16,7 @@ import {
 } from "./lib/host-json-collector";
 import { compressedDevinCollectorScript } from "./lib/devin-sqlite-collector";
 import { compressedKilocodeCollectorScript } from "./lib/kilocode-sqlite-collector";
-import { pricingRevision, pricingVersion } from "./lib/pricing";
+import { priceFor, pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
@@ -24,6 +24,9 @@ import { createAccountPoolLimitsLoader, mergeAccountPoolLimits } from "./lib/acc
 import {
   copilotEnterpriseLimitsCommand, copilotEnterpriseSnapshotSchema, normalizeCopilotEnterpriseHost,
 } from "./lib/copilot-enterprise";
+import {
+  eventSessionIndicator, pricingProviderFor, unavailableSessionIndicator, type SessionIndicatorData,
+} from "./lib/session-indicator";
 import {
   PI_SESSION_INDICATOR_BEGIN,
   PI_SESSION_INDICATOR_END,
@@ -65,18 +68,34 @@ const providerLimitSchema = z.object({
     status: z.enum(["ok", "error"]), error: z.string().nullable(), lastUpdatedAt: z.string().nullable(),
   })),
 });
+const usageBucketSchema = z.object({
+  label: z.string(), kind: z.enum(["model", "tool", "other"]),
+  inputTokens: z.number(), outputTokens: z.number(),
+  cacheReadTokens: z.number(), cacheWriteTokens: z.number(),
+  costUsd: z.number().nullable(),
+});
 const piSessionIndicatorSchema = z.object({
   available: z.boolean(),
   inputTokens: z.number(), outputTokens: z.number(),
   cacheReadTokens: z.number(), cacheWriteTokens: z.number(),
   latestCacheHitRate: z.number().nullable(), costUsd: z.number(),
   subscription: z.boolean(), autoCompaction: z.boolean(),
+  breakdown: z.array(usageBucketSchema).default([]),
 });
-const sessionIndicatorSchema = piSessionIndicatorSchema.extend({
+const sessionIndicatorSchema = z.object({
+  available: z.boolean(),
+  source: z.enum(["pi-session", "bb-events"]),
+  inputTokens: z.number(), outputTokens: z.number(),
+  cacheReadTokens: z.number(), cacheWriteTokens: z.number(),
+  latestCacheHitRate: z.number().nullable(),
+  costUsd: z.number().nullable(), costEstimated: z.boolean(), pricedModel: z.string().nullable(),
+  subscription: z.boolean(),
+  autoCompaction: z.boolean().nullable(), autoCompactAtTokens: z.number().nullable(),
   contextUsedTokens: z.number().nullable(),
   contextWindowTokens: z.number().nullable(),
   contextEstimated: z.boolean(),
-});
+  breakdown: z.array(usageBucketSchema),
+}) satisfies z.ZodType<SessionIndicatorData>;
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
 
@@ -879,78 +898,118 @@ export async function runHostCommand(
   }
 }
 
-const unavailableSessionIndicator = (): z.infer<typeof sessionIndicatorSchema> => ({
-  available: false,
-  inputTokens: 0,
-  outputTokens: 0,
-  cacheReadTokens: 0,
-  cacheWriteTokens: 0,
-  latestCacheHitRate: null,
-  costUsd: 0,
-  subscription: false,
-  autoCompaction: false,
-  contextUsedTokens: null,
-  contextWindowTokens: null,
-  contextEstimated: true,
-});
+type ThreadEventRow = Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["events"]["list"]>>[number];
 
-export async function loadSessionIndicator(bb: BbPluginApi, threadId: string) {
-  const signal = AbortSignal.timeout(15_000);
-  const thread = await bb.sdk.threads.get({ threadId, include: "environment,host", signal });
-  if (thread.providerId !== "pi") return unavailableSessionIndicator();
+async function latestThreadEvent<T extends ThreadEventRow["type"]>(
+  bb: BbPluginApi, threadId: string, type: T, signal: AbortSignal,
+): Promise<Extract<ThreadEventRow, { type: T }> | null> {
+  const rows = await bb.sdk.threads.events.list({ threadId, types: [type], order: "desc", limit: "1", signal })
+    .catch(() => []);
+  const row = rows[0];
+  return row && row.type === type ? row as Extract<ThreadEventRow, { type: T }> : null;
+}
 
-  const identityRows = await bb.sdk.threads.events.list({
-    threadId,
-    types: ["thread/identity"],
-    order: "desc",
-    limit: "1",
-    signal,
-  });
-  const identity = identityRows[0];
-  if (!identity || identity.type !== "thread/identity") return unavailableSessionIndicator();
+/** The model of the thread's latest requested turn, as bb recorded it. */
+async function latestRequestedModel(bb: BbPluginApi, threadId: string, signal: AbortSignal) {
+  const row = await latestThreadEvent(bb, threadId, "client/turn/requested", signal);
+  const execution = row && "execution" in row.data ? (row.data as { execution?: { model?: unknown } }).execution : undefined;
+  return typeof execution?.model === "string" && execution.model ? execution.model : null;
+}
+
+async function loadPiSessionSummary(
+  bb: BbPluginApi,
+  thread: Awaited<ReturnType<BbPluginApi["sdk"]["threads"]["get"]>>,
+  threadId: string,
+  signal: AbortSignal,
+) {
+  const identity = await latestThreadEvent(bb, threadId, "thread/identity", signal);
+  if (!identity) return null;
   const providerThreadId = identity.data.providerThreadId;
-  if (!/^[A-Za-z0-9_-]+$/.test(providerThreadId)) return unavailableSessionIndicator();
+  if (!/^[A-Za-z0-9_-]+$/.test(providerThreadId)) return null;
 
   const includedHost = "host" in thread ? thread.host : null;
   const includedEnvironment = "environment" in thread ? thread.environment : null;
   const hostId = includedHost?.id ?? includedEnvironment?.hostId;
-  if (!hostId) return unavailableSessionIndicator();
+  if (!hostId) return null;
   const host = includedHost ?? await bb.sdk.hosts.get({ hostId, signal });
-  if (host.status !== "connected") return unavailableSessionIndicator();
+  if (host.status !== "connected") return null;
   const home = (await bb.sdk.hosts.directory({ hostId, signal })).directory;
   const sessionFile = `${home.replace(/[\\/]$/, "")}/.bb/pi-bridge-sessions/${providerThreadId}.jsonl`;
-  // The trailing newline is required so heldHostCommand() does not append its
-  // closing subshell syntax to the heredoc terminator line.
+  // The trailing newline after the heredoc delimiter is required: the host
+  // wrapper appends its own text and the delimiter must stand on its own line.
   const command = `BB_PI_SESSION_FILE=${shellQuote(sessionFile)} node - <<'__BB_PI_SESSION_INDICATOR__'\n${piSessionIndicatorScript}\n__BB_PI_SESSION_INDICATOR__\n`;
-
-  const [output, contextRows] = await Promise.all([
-    runHostCommand(bb, host, command, signal, {
-      title: "Usage: live Pi session", timeoutMs: 12_000, home,
-    }),
-    bb.sdk.threads.events.list({
-      threadId,
-      types: ["thread/contextWindowUsage/updated"],
-      order: "desc",
-      limit: "1",
-      signal,
-    }).catch(() => []),
-  ]);
+  const output = await runHostCommand(bb, host, command, signal, {
+    title: "Usage: live Pi session", timeoutMs: 12_000, home,
+  });
   const summaryMatch = output.match(new RegExp(
     `${PI_SESSION_INDICATOR_BEGIN}\\s*([\\s\\S]*?)\\s*${PI_SESSION_INDICATOR_END}`,
   ));
-  if (!summaryMatch) return unavailableSessionIndicator();
+  if (!summaryMatch) return null;
   const summary = piSessionIndicatorSchema.parse(JSON.parse(summaryMatch[1]!));
-  if (!summary.available) return unavailableSessionIndicator();
+  return summary.available ? summary : null;
+}
 
-  const contextRow = contextRows[0];
-  const context = contextRow?.type === "thread/contextWindowUsage/updated"
-    ? contextRow.data.contextWindowUsage
-    : null;
-  return sessionIndicatorSchema.parse({
-    ...summary,
+/**
+ * The live footer for any provider. Context and token totals come from the
+ * events every bb provider bridge emits; a Pi thread additionally reads its
+ * session file on the host for exact recorded cost, compaction settings and a
+ * per-model/tool breakdown. Other providers' cost is a models.dev estimate.
+ */
+export async function loadSessionIndicator(bb: BbPluginApi, threadId: string): Promise<SessionIndicatorData> {
+  const signal = AbortSignal.timeout(15_000);
+  const thread = await bb.sdk.threads.get({ threadId, include: "environment,host", signal });
+  const isPi = thread.providerId === "pi";
+
+  const [contextRow, usageRow, rateLimitRow, piSummary] = await Promise.all([
+    latestThreadEvent(bb, threadId, "thread/contextWindowUsage/updated", signal),
+    latestThreadEvent(bb, threadId, "thread/tokenUsage/updated", signal),
+    latestThreadEvent(bb, threadId, "provider/rateLimits/updated", signal),
+    isPi
+      ? loadPiSessionSummary(bb, thread, threadId, signal).catch((error) => {
+          bb.log?.debug?.(`Pi session summary unavailable for ${threadId}: ${errorMessage(error)}`);
+          return null;
+        })
+      : Promise.resolve(null),
+  ]);
+  const context = contextRow?.data.contextWindowUsage ?? null;
+  const contextFields = {
+    autoCompactAtTokens: context?.snapshot?.autoCompactAtTokens ?? null,
     contextUsedTokens: context?.usedTokens ?? null,
-    contextWindowTokens: context?.modelContextWindow ?? null,
+    contextWindowTokens: context?.modelContextWindow ?? usageRow?.data.tokenUsage.modelContextWindow ?? null,
     contextEstimated: context?.estimated ?? true,
+  };
+
+  if (piSummary) {
+    return sessionIndicatorSchema.parse({
+      ...piSummary,
+      source: "pi-session",
+      costEstimated: false,
+      pricedModel: null,
+      ...contextFields,
+    });
+  }
+
+  // Pi's own `tokenUsage.total` is per turn, not per session; without its
+  // session file only the context is trustworthy.
+  const tokenUsage = !isPi ? usageRow?.data.tokenUsage ?? null : null;
+  if (!tokenUsage && contextFields.contextWindowTokens === null) return unavailableSessionIndicator();
+
+  const subscription = rateLimitRow?.data.rateLimits.kind === "subscription-window";
+  const base = { ...unavailableSessionIndicator(), available: true, subscription, ...contextFields };
+  if (!tokenUsage) return sessionIndicatorSchema.parse(base);
+
+  const model = await latestRequestedModel(bb, threadId, signal);
+  const price = model ? priceFor(pricingProviderFor(thread.providerId), model) : null;
+  return sessionIndicatorSchema.parse({
+    ...base,
+    ...eventSessionIndicator({
+      providerId: thread.providerId,
+      total: tokenUsage.total,
+      last: tokenUsage.last,
+      model,
+      price,
+      subscription,
+    }),
   });
 }
 
@@ -1430,10 +1489,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  const publishSessionIndicatorUpdate = ({ thread }: { thread: { id: string; providerId: string } }) => {
-    if (thread.providerId === "pi") {
-      bb.realtime.publish("session-indicator-updated", { threadId: thread.id });
-    }
+  const publishSessionIndicatorUpdate = ({ thread }: { thread: { id: string } }) => {
+    bb.realtime.publish("session-indicator-updated", { threadId: thread.id });
   };
   bb.events?.on("thread.idle", publishSessionIndicatorUpdate);
   bb.events?.on("thread.failed", publishSessionIndicatorUpdate);

@@ -9,8 +9,13 @@ import {
   piSessionIndicatorScript,
 } from "./pi-session-indicator-command";
 import {
+  cacheHitRate,
+  contextLevel,
+  eventSessionIndicator,
   formatIndicatorTokens,
   formatSessionIndicator,
+  normalizeTokenUsage,
+  sessionIndicatorParts,
   type SessionIndicatorData,
 } from "./session-indicator";
 
@@ -22,6 +27,7 @@ afterEach(() => {
 function fixtureData(overrides: Partial<SessionIndicatorData> = {}): SessionIndicatorData {
   return {
     available: true,
+    source: "pi-session",
     inputTokens: 80_000,
     outputTokens: 6_900,
     cacheReadTokens: 767_000,
@@ -30,9 +36,13 @@ function fixtureData(overrides: Partial<SessionIndicatorData> = {}): SessionIndi
     costUsd: 0.766,
     subscription: true,
     autoCompaction: true,
+    autoCompactAtTokens: null,
+    costEstimated: false,
+    pricedModel: null,
     contextUsedTokens: 78_336,
     contextWindowTokens: 272_000,
     contextEstimated: true,
+    breakdown: [],
     ...overrides,
   };
 }
@@ -141,6 +151,98 @@ describe("Pi session indicator host script", () => {
       costUsd: 2.1,
       subscription: true,
       autoCompaction: false,
+      breakdown: [
+        { label: "openai-codex/gpt-test", kind: "model", inputTokens: 120, outputTokens: 31, cacheReadTokens: 1_080, cacheWriteTokens: 0, costUsd: 0.7 },
+        { label: "tool", kind: "tool", inputTokens: 3, outputTokens: 4, cacheReadTokens: 5, cacheWriteTokens: 6, costUsd: 0.2 },
+        { label: "other", kind: "other", inputTokens: 7, outputTokens: 8, cacheReadTokens: 9, cacheWriteTokens: 10, costUsd: 0.3 },
+        { label: "compaction", kind: "other", inputTokens: 11, outputTokens: 12, cacheReadTokens: 13, cacheWriteTokens: 14, costUsd: 0.4 },
+        { label: "branch summary", kind: "other", inputTokens: 15, outputTokens: 16, cacheReadTokens: 17, cacheWriteTokens: 18, costUsd: 0.5 },
+      ],
     });
+  });
+});
+
+describe("session footer parts", () => {
+  it("splits Ultimate's tokens, cost and context items", () => {
+    expect(sessionIndicatorParts(fixtureData())).toEqual({
+      tokens: ["↑80k", "↓6.9k", "R767k", "CH97.7%"],
+      cost: "$0.766",
+      subscription: true,
+      context: "28.8%/272k",
+      contextPercent: expect.closeTo(28.8, 1),
+    });
+  });
+
+  it("marks estimated cost and hides unknown cost", () => {
+    expect(sessionIndicatorParts(fixtureData({ costEstimated: true, subscription: false }))?.cost).toBe("~$0.766");
+    const unknown = sessionIndicatorParts(fixtureData({ costUsd: null }));
+    expect(unknown?.cost).toBeNull();
+    expect(unknown?.subscription).toBe(false);
+  });
+
+  it("hides a subscription's $0.000 until there is usage", () => {
+    expect(sessionIndicatorParts(fixtureData({
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, costUsd: 0, latestCacheHitRate: null,
+    }))).toMatchObject({ tokens: [], cost: null });
+  });
+
+  it("returns nothing when there is nothing to show", () => {
+    expect(sessionIndicatorParts(fixtureData({ available: false }))).toBeNull();
+    expect(sessionIndicatorParts(fixtureData({
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, costUsd: 0, subscription: false,
+      latestCacheHitRate: null, contextWindowTokens: null,
+    }))).toBeNull();
+  });
+
+  it("uses Ultimate's warning (>70%) and error (>90%) thresholds", () => {
+    expect([null, 70, 70.1, 90, 90.1].map(contextLevel)).toEqual(["normal", "normal", "warning", "warning", "error"]);
+  });
+});
+
+describe("provider-neutral token usage", () => {
+  it("removes cached input from Codex's inclusive input count", () => {
+    expect(normalizeTokenUsage("codex", {
+      inputTokens: 62_926_795, cachedInputTokens: 62_408_832, cacheReadInputTokens: 62_408_832, outputTokens: 108_217,
+    })).toEqual({ input: 517_963, output: 108_217, cacheRead: 62_408_832, cacheWrite: 0 });
+  });
+
+  it("keeps Anthropic-style exclusive input and the read/write split", () => {
+    const tokens = normalizeTokenUsage("claude-code", {
+      inputTokens: 6, cachedInputTokens: 106_868, cacheReadInputTokens: 100_381, cacheWriteInputTokens: 6_487, outputTokens: 3_329,
+    });
+    expect(tokens).toEqual({ input: 6, output: 3_329, cacheRead: 100_381, cacheWrite: 6_487 });
+    expect(cacheHitRate(tokens)).toBeCloseTo(93.9, 1);
+  });
+
+  it("treats cached input without a split as cache reads", () => {
+    expect(normalizeTokenUsage("acp", { inputTokens: 10, cachedInputTokens: 90, outputTokens: 1 }))
+      .toEqual({ input: 10, output: 1, cacheRead: 90, cacheWrite: 0 });
+  });
+
+  it("estimates cost from catalog rates and reports one model bucket", () => {
+    const result = eventSessionIndicator({
+      providerId: "codex",
+      total: { inputTokens: 1_100_000, cachedInputTokens: 1_000_000, outputTokens: 10_000 },
+      last: { inputTokens: 1_000, cachedInputTokens: 900, outputTokens: 5 },
+      model: "gpt-test",
+      price: { input: 1, cached: 0.1, cacheWrite: 1, output: 10 },
+      subscription: true,
+    });
+    expect(result).toMatchObject({
+      inputTokens: 100_000,
+      cacheReadTokens: 1_000_000,
+      latestCacheHitRate: 90,
+      costEstimated: true,
+      pricedModel: "gpt-test",
+      breakdown: [{ label: "gpt-test", kind: "model" }],
+    });
+    expect(result.costUsd).toBeCloseTo(0.1 + 0.1 + 0.1, 6);
+  });
+
+  it("leaves cost unknown without a rate", () => {
+    expect(eventSessionIndicator({
+      providerId: "acp", total: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 }, last: null,
+      model: null, price: null, subscription: false,
+    })).toMatchObject({ costUsd: null, costEstimated: false, breakdown: [] });
   });
 });

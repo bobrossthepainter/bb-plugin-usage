@@ -186,12 +186,25 @@ describe("live Pi session indicator", () => {
       "__BB_HOST_COMMAND_DONE__:0",
     ].join("\n");
     const create = vi.fn(async () => ({ id: "terminal-1" }));
-    const eventsList = vi.fn(async (request: { types: string[] }) => request.types[0] === "thread/identity"
-      ? [{ type: "thread/identity", data: { providerThreadId: "pi_session-1" } }]
-      : [{
+    const eventsList = vi.fn(async (request: { types: string[] }) => {
+      switch (request.types[0]) {
+        case "thread/identity": return [{ type: "thread/identity", data: { providerThreadId: "pi_session-1" } }];
+        case "thread/contextWindowUsage/updated": return [{
           type: "thread/contextWindowUsage/updated",
           data: { contextWindowUsage: { usedTokens: 288_000, modelContextWindow: 1_000_000, estimated: false } },
-        }]);
+        }];
+        // Pi's per-turn tokenUsage must not replace the session file's totals.
+        case "thread/tokenUsage/updated": return [{
+          type: "thread/tokenUsage/updated",
+          data: { tokenUsage: {
+            total: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2, reasoningOutputTokens: 0 },
+            last: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2, reasoningOutputTokens: 0 },
+            modelContextWindow: 1_000_000,
+          } },
+        }];
+        default: return [];
+      }
+    });
     const bb = {
       sdk: {
         threads: {
@@ -216,6 +229,10 @@ describe("live Pi session indicator", () => {
 
     await expect(loadSessionIndicator(bb, "thread-1")).resolves.toMatchObject({
       available: true,
+      source: "pi-session",
+      costUsd: 0.766,
+      costEstimated: false,
+      autoCompaction: true,
       inputTokens: 80_000,
       latestCacheHitRate: 97.7,
       subscription: true,
@@ -229,6 +246,68 @@ describe("live Pi session indicator", () => {
     }));
     const startCommand = create.mock.calls[0]![0].start.command;
     expect(startCommand).toContain("__BB_PI_SESSION_INDICATOR__\n );");
+  });
+});
+
+describe("live session indicator for other providers", () => {
+  const codexEvents = (subscription: boolean) => vi.fn(async (request: { types: string[] }) => {
+    switch (request.types[0]) {
+      case "thread/contextWindowUsage/updated": return [{
+        type: "thread/contextWindowUsage/updated",
+        data: { contextWindowUsage: { usedTokens: 178_058, modelContextWindow: 258_400, estimated: false } },
+      }];
+      case "thread/tokenUsage/updated": return [{
+        type: "thread/tokenUsage/updated",
+        data: { tokenUsage: {
+          total: { totalTokens: 1_110_000, inputTokens: 1_100_000, cachedInputTokens: 1_000_000, cacheReadInputTokens: 1_000_000, outputTokens: 10_000, reasoningOutputTokens: 0 },
+          last: { totalTokens: 1_000, inputTokens: 1_000, cachedInputTokens: 900, cacheReadInputTokens: 900, outputTokens: 5, reasoningOutputTokens: 0 },
+          modelContextWindow: 258_400,
+        } },
+      }];
+      case "provider/rateLimits/updated": return subscription
+        ? [{ type: "provider/rateLimits/updated", data: { rateLimits: { kind: "subscription-window" } } }]
+        : [];
+      case "client/turn/requested": return [{ type: "client/turn/requested", data: { execution: { model: "gpt-5" } } }];
+      default: return [];
+    }
+  });
+
+  it("reduces Codex events without touching the host", async () => {
+    const create = vi.fn();
+    const bb = {
+      sdk: {
+        threads: { get: vi.fn(async () => ({ providerId: "codex" })), events: { list: codexEvents(true) } },
+        terminals: { create },
+      },
+    } as unknown as BbPluginApi;
+
+    const result = await loadSessionIndicator(bb, "thread-2");
+    expect(result).toMatchObject({
+      available: true,
+      source: "bb-events",
+      inputTokens: 100_000,
+      outputTokens: 10_000,
+      cacheReadTokens: 1_000_000,
+      cacheWriteTokens: 0,
+      latestCacheHitRate: 90,
+      subscription: true,
+      autoCompaction: null,
+      contextUsedTokens: 178_058,
+      contextWindowTokens: 258_400,
+      contextEstimated: false,
+    });
+    // gpt-5 is in the bundled models.dev snapshot, so cost is an estimate.
+    expect(result.costEstimated).toBe(true);
+    expect(result.costUsd).toBeGreaterThan(0);
+    expect(result.breakdown).toEqual([expect.objectContaining({ label: "gpt-5", kind: "model" })]);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("is unavailable with neither usage nor a context window", async () => {
+    const bb = {
+      sdk: { threads: { get: vi.fn(async () => ({ providerId: "acp" })), events: { list: vi.fn(async () => []) } } },
+    } as unknown as BbPluginApi;
+    await expect(loadSessionIndicator(bb, "thread-3")).resolves.toMatchObject({ available: false });
   });
 });
 
